@@ -1,15 +1,15 @@
 """Smart Campus Energy Optimization API.
 
-LLM reads the operator notes, deterministic code checks what it said, the LP does the maths,
-and the finished plan is validated against the judge's own rules before it leaves.
+LLM reads the operator notes, guard.py checks what it said, the LP does the maths, and the
+finished plan is validated against the judge's own rules before it leaves.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -24,8 +24,9 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+import guard
 import llm
 import solver
 
@@ -54,32 +55,51 @@ def _json(body, status=200):
     return Response(orjson.dumps(body), status_code=status, media_type="application/json")
 
 
-# --- request schema ----------------------------------------------------------
+# --- request schema (section 07) ----------------------------------------------
+# Strict numbers: true/false or "180" are not kWh. Any violation is a 400 (section 6.1).
 
-class _Strict(BaseModel):
-    model_config = ConfigDict(allow_inf_nan=False)
-
-
-class HourIn(_Strict):
-    hour: int = Field(ge=0, le=23)
-    demand_kwh: float = Field(ge=0)
-    solar_kwh: float = Field(ge=0)
-    tariff_bdt_per_kwh: float
+Num = Annotated[float, Field(strict=True, allow_inf_nan=False)]
+NonNeg = Annotated[float, Field(strict=True, allow_inf_nan=False, ge=0)]
+Note = Annotated[str, Field(strict=True)]
 
 
-class BatteryIn(_Strict):
-    capacity_kwh: float = Field(gt=0)
-    initial_energy_kwh: float = Field(ge=0)
-    minimum_energy_kwh: float = Field(ge=0)
-    max_charge_kwh_per_hour: float = Field(ge=0)
-    max_discharge_kwh_per_hour: float = Field(ge=0)
+class HourIn(BaseModel):
+    hour: Annotated[int, Field(strict=True, ge=0, le=23)]
+    demand_kwh: NonNeg
+    solar_kwh: NonNeg
+    tariff_bdt_per_kwh: Num
 
 
-class ScenarioIn(_Strict):
-    scenario_id: str
-    operator_notes: list[str] = Field(min_length=1)
+class BatteryIn(BaseModel):
+    capacity_kwh: Annotated[float, Field(strict=True, allow_inf_nan=False, gt=0)]
+    initial_energy_kwh: NonNeg
+    minimum_energy_kwh: NonNeg
+    max_charge_kwh_per_hour: NonNeg
+    max_discharge_kwh_per_hour: NonNeg
+
+    @model_validator(mode="after")
+    def _consistent(self):
+        if self.minimum_energy_kwh > self.capacity_kwh:
+            raise ValueError("minimum_energy_kwh exceeds capacity_kwh")
+        if not self.minimum_energy_kwh <= self.initial_energy_kwh <= self.capacity_kwh:
+            raise ValueError("initial_energy_kwh must lie between minimum_energy_kwh and capacity_kwh")
+        return self
+
+
+class ScenarioIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=False)
+
+    scenario_id: Annotated[str, Field(strict=True)]
+    operator_notes: Annotated[list[Note], Field(min_length=1, max_length=3)]
     hours: list[HourIn]
     battery: BatteryIn
+
+    @field_validator("operator_notes")
+    @classmethod
+    def _non_empty(cls, v):
+        if any(not n.strip() for n in v):
+            raise ValueError("operator_notes must be non-empty strings")
+        return v
 
     @field_validator("hours")
     @classmethod
@@ -89,20 +109,10 @@ class ScenarioIn(_Strict):
         return v
 
 
-def _semantic_errors(b):
-    """Well-formed but impossible batteries (section 6.1: 422)."""
-    errs = []
-    if b["minimum_energy_kwh"] > b["capacity_kwh"]:
-        errs.append("minimum_energy_kwh exceeds capacity_kwh")
-    if not b["minimum_energy_kwh"] <= b["initial_energy_kwh"] <= b["capacity_kwh"]:
-        errs.append("initial_energy_kwh must lie between minimum_energy_kwh and capacity_kwh")
-    return errs
-
-
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_request: Request, exc: RequestValidationError):
-    # malformed JSON or a structurally invalid body are both 400 (section 6.1)
-    errors = [{"loc": list(e.get("loc", ())), "msg": e.get("msg", "")} for e in exc.errors()]
+    errors = [{"loc": [str(x) for x in e.get("loc", ())], "msg": str(e.get("msg", ""))}
+              for e in exc.errors()]
     return _json({"detail": "invalid request", "errors": errors[:20]}, 400)
 
 
@@ -130,94 +140,33 @@ async def index():
     return FileResponse(page) if os.path.isfile(page) else _json({"status": "ok"})
 
 
-# --- guardrails --------------------------------------------------------------
+# --- interpretation ------------------------------------------------------------
 
-def _finite(x):
-    try:
-        x = float(x)
-    except (TypeError, ValueError):
-        return None
-    return x if math.isfinite(x) else None
-
-
-def _clean_hours(adj):
-    raw = adj.get("hours")
-    if raw is None:
-        # tolerate {"start_hour": 13, "end_hour": 15} style windows: end exclusive, may wrap midnight
-        a = _finite(adj.get("start_hour", adj.get("start")))
-        b = _finite(adj.get("end_hour", adj.get("end")))
-        if a is None or b is None:
-            return []
-        a, b = int(a) % 24, int(b) % 24
-        raw = [(a + k) % 24 for k in range((b - a) % 24 or 24)]
-    out = set()
-    for h in raw if isinstance(raw, (list, tuple)) else [raw]:
-        v = _finite(h)
-        if v is not None and v == int(v) and 0 <= v < solver.H:
-            out.add(int(v))
-    return sorted(out)
-
-
-def normalize(entry, index, capacity):
-    """Turn one untrusted LLM entry into a schema-legal directive, or no_op (section 08)."""
-    no_op = {"note_index": index, "applies": False, "directive_type": "no_op",
-             "structured_adjustment": None,
-             "explanation": "This note does not affect today's energy schedule."}
-    if not isinstance(entry, dict):
-        return no_op
-
-    t = entry.get("directive_type")
-    if t not in solver.DIRECTIVE_TYPES or t == "no_op":
-        if t == "no_op" and entry.get("explanation"):
-            no_op["explanation"] = str(entry["explanation"])[:300]
-        return no_op
-
-    adj = entry.get("structured_adjustment")
-    if not isinstance(adj, dict):
-        return no_op
-    hours = _clean_hours(adj)
-    if not hours:
-        return no_op
-
-    out = {"hours": hours}
-    if t == "solar_reduction":
-        f = _finite(adj.get("factor"))
-        if f is None or f < 0:
-            return no_op
-        if 1 < f <= 100:
-            f /= 100  # model wrote a percentage: "20" means 20% remains
-        out["factor"] = min(1.0, f)
-    elif t == "minimum_battery_reserve":
-        v = _finite(adj.get("minimum_energy_kwh"))
-        if v is None or v < 0:
-            return no_op
-        out["minimum_energy_kwh"] = min(capacity, v)
-    elif t == "max_grid_window":
-        v = _finite(adj.get("max_grid_kwh"))
-        if v is None or v < 0:
-            return no_op
-        out["max_grid_kwh"] = v
-
-    explanation = entry.get("explanation")
-    return {
-        "note_index": index,
-        "applies": True,
-        "directive_type": t,
-        "structured_adjustment": out,
-        "explanation": str(explanation)[:300] if explanation else f"Directive extracted from note {index}.",
-    }
+normalize = guard.normalize
 
 
 def interpret_notes(raw, notes, capacity):
-    """Exactly one entry per note, in note_index order, whatever the model returned."""
+    """Exactly one guardrail-clean entry per note, in note_index order.
+
+    A note the LLM did not answer usably goes to the regex fallback, and failing that to
+    no_op. Nothing is ever clamped or guessed into a directive.
+    """
     by_index = {}
     for e in raw or []:
         if isinstance(e, dict):
-            i = _finite(e.get("note_index"))
-            if i is not None and 0 <= int(i) < len(notes) and int(i) not in by_index:
+            i = guard._finite(e.get("note_index"))
+            if i is not None and i == int(i) and 0 <= int(i) < len(notes) and int(i) not in by_index:
                 by_index[int(i)] = e
-    return [normalize(by_index[i] if i in by_index else llm.rule_parse(i, note), i, capacity)
-            for i, note in enumerate(notes)]
+    out = []
+    for i, note in enumerate(notes):
+        v = guard.validate(by_index.get(i), capacity)
+        if v is None:
+            v = guard.validate(llm.rule_parse(i, note, capacity), capacity)
+        if v is not None and not guard.grounded(note, v):
+            log.warning("vetoed %s on a note with no energy content", v["directive_type"])
+            v = None
+        out.append({"note_index": i, **v} if v else guard.no_op(i))
+    return out
 
 
 # --- endpoint ----------------------------------------------------------------
@@ -238,10 +187,6 @@ def _summary(directives, plan, tot, note, source):
 @app.post("/optimize-energy")
 async def optimize_energy(req: ScenarioIn):
     scenario = req.model_dump()
-    errs = _semantic_errors(scenario["battery"])
-    if errs:
-        return _json({"detail": "semantically invalid scenario", "errors": errs}, 422)
-
     notes = scenario["operator_notes"]
     capacity = scenario["battery"]["capacity_kwh"]
 
@@ -254,7 +199,11 @@ async def optimize_energy(req: ScenarioIn):
         plan, tot, note = solver.solve(scenario, directives)
     except Exception:
         log.exception("optimization failed")
-        model = solver.build_model(scenario, directives)
+        # still honour the directives we can (reduced solar, blocked windows) in the idle plan
+        try:
+            model = solver.build_model(scenario, directives)
+        except Exception:
+            model = solver.build_model(scenario, [])
         plan = solver.idle_plan(model)
         tot = solver.totals(model, plan)
         note = "fallback: battery held idle (optimizer error)"

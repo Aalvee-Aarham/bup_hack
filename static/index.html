@@ -123,6 +123,10 @@ async function optimize() {
     return;
   }
   body.operator_notes = document.getElementById('notes').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (body.operator_notes.length < 1 || body.operator_notes.length > 3) {
+    err.textContent = 'Enter 1 to 3 operator notes, one per line (e.g. "Routine shift, no adjustments.").';
+    return;
+  }
   status.textContent = 'optimizing...';
   const t0 = performance.now();
   try {
@@ -130,7 +134,10 @@ async function optimize() {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
     });
     const data = await res.json();
-    if (!res.ok) throw new Error(res.status + ' ' + JSON.stringify(data));
+    if (!res.ok) {
+      const fields = (data.errors || []).map(e => (e.loc || []).slice(1).join('.') + ': ' + e.msg).join('\n');
+      throw new Error(`${res.status} ${data.detail || 'request failed'}${fields ? '\n' + fields : ''}`);
+    }
     render(data);
     status.textContent = Math.round(performance.now() - t0) + ' ms';
   } catch (e) {

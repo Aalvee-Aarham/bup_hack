@@ -1,0 +1,49 @@
+# Builds the fallback image on every push to main, publishes it to GHCR with an exact
+# commit-SHA tag, then proves the published image starts and answers /health with no keys.
+name: docker-image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/aalvee-aarham/bup_hack
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Smoke test the published image (no secrets)
+        run: |
+          docker run -d --name api -p 8000:8000 ${{ env.IMAGE }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -sf localhost:8000/health; then
+              curl -sf -X POST localhost:8000/optimize-energy -H 'content-type: application/json' \
+                --data-binary @sample.json | python3 -c "import json,sys; r=json.load(sys.stdin); assert len(r['hourly_plan'])==24; print('optimize ok', r['total_cost_bdt'])"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs api
+          exit 1

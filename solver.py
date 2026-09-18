@@ -76,12 +76,12 @@ def build_model(scenario, directives):
         hrs = [h for h in adj.get("hours", []) if 0 <= h < H]
         t = d.get("directive_type")
         if t == "solar_reduction":
-            f = float(adj["factor"])
+            f = min(1.0, max(0.0, float(adj.get("factor", 1.0))))
             for h in hrs:
                 # product, not min: never exceeds either composition order the judge might use
                 m["eff_solar"][h] *= f
         elif t == "minimum_battery_reserve":
-            v = float(adj["minimum_energy_kwh"])
+            v = min(m["capacity"], max(0.0, float(adj.get("minimum_energy_kwh", m["base_min_e"]))))
             for h in hrs:
                 m["min_e"][h] = max(m["min_e"][h], v)
         elif t == "no_charge_window":
@@ -91,7 +91,7 @@ def build_model(scenario, directives):
             for h in hrs:
                 m["can_discharge"][h] = False
         elif t == "max_grid_window":
-            v = float(adj["max_grid_kwh"])
+            v = max(0.0, float(adj.get("max_grid_kwh", math.inf)))
             for h in hrs:
                 m["max_grid"][h] = min(m["max_grid"][h], v)
     return m
@@ -152,10 +152,12 @@ def _repair(m, net):
             soc += net[h]
 
         resid = round(soc - m["e0"], 4)
+        min_e = m["min_e"]
         if not m["neutral"] or abs(resid) < 1e-9:
             break
-        # push the rounding residual into the hour with the most room to absorb it
-        j = int(np.argmax(np.abs(net)))
+        j = _absorber(m, net, min_e, resid)
+        if j is None:
+            break  # at most 24 x 0.00005 kWh off: inside the 0.01 tolerance anyway
         net[j] = round(net[j] - resid, 4)
 
     plan, soc = [], m["e0"]
@@ -174,6 +176,28 @@ def _repair(m, net):
             "battery_energy_after_kwh": _r(soc),
         })
     return plan
+
+
+def _absorber(m, net, min_e, resid):
+    """The active hour that can take -resid without breaking a rate limit, a blocked window
+    or any later state-of-charge bound. Active only: an idle hour must stay exactly idle."""
+    soc = np.concatenate([[m["e0"]], m["e0"] + np.cumsum(net)])
+    best, room = None, -1.0
+    for h in range(H):
+        n = net[h] - resid
+        if net[h] == 0 or (n > 0) != (net[h] > 0):
+            continue
+        hi = m["max_chg"] if m["can_charge"][h] else 0.0
+        lo = -m["max_dis"] if m["can_discharge"][h] else 0.0
+        if not lo <= n <= hi or n < -m["demand"][h]:
+            continue
+        later = soc[h + 1:] - resid
+        if (later < min_e[h:] - 1e-9).any() or (later > m["capacity"] + 1e-9).any():
+            continue
+        slack = min(hi - n, n - lo)
+        if slack > room:
+            best, room = h, slack
+    return best
 
 
 def idle_plan(m):
@@ -274,7 +298,8 @@ def solve(scenario, directives):
         scenario["battery"],
         [[d["directive_type"], d["structured_adjustment"]] for d in directives if d.get("applies")],
     ], option=orjson.OPT_SORT_KEYS)
-    return _solve_cached(key)
+    plan, tot, note = _solve_cached(key)
+    return [dict(p) for p in plan], dict(tot), note
 
 
 @functools.lru_cache(maxsize=4096)
@@ -296,7 +321,7 @@ def _solve(scenario, directives):
         tot = totals(r, plan)
         if not validate_plan(r, plan, tot):
             return plan, tot, note
-        break  # feasible but repair drifted: relaxing directives would not help
+        # repair failed validation: try the next rung before falling to the idle floor
 
     plan = idle_plan(m)
     return plan, totals(m, plan), "fallback: battery held idle"

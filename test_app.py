@@ -280,10 +280,11 @@ def main():
 
     assert adj({"directive_type": "solar_reduction",
                 "structured_adjustment": {"hours": [14, 13, 13, "14"], "factor": 1.0}}) == {"hours": [13, 14], "factor": 1.0}
-    assert adj({"directive_type": "solar_reduction",
-                "structured_adjustment": {"hours": [13], "factor": 20}})["factor"] == 0.2, "percent → fraction"
-    assert adj({"directive_type": "minimum_battery_reserve",
-                "structured_adjustment": {"hours": [3], "minimum_energy_kwh": 9999}})["minimum_energy_kwh"] == 500.0
+    # out-of-range values are rejected, never clamped or rescaled into a directive
+    assert api.normalize({"directive_type": "solar_reduction",
+                          "structured_adjustment": {"hours": [13], "factor": 20}}, 0, 500.0)["directive_type"] == "no_op"
+    assert api.normalize({"directive_type": "minimum_battery_reserve",
+                          "structured_adjustment": {"hours": [3], "minimum_energy_kwh": 9999}}, 0, 500.0)["directive_type"] == "no_op"
     assert adj({"directive_type": "no_charge_window",
                 "structured_adjustment": {"start_hour": 22, "end_hour": 2}})["hours"] == [0, 1, 22, 23], "wraps midnight"
 
@@ -303,8 +304,8 @@ def main():
     assert client.post("/optimize-energy", json={"scenario_id": "x"}).status_code == 400
     nan = json.dumps(scenario(["x"])).replace('"demand_kwh": 180.0', '"demand_kwh": NaN')
     assert client.post("/optimize-energy", content=nan, headers={"content-type": "application/json"}).status_code == 400
-    assert client.post("/optimize-energy", json=scenario(["x"], initial_energy_kwh=900.0)).status_code == 422
-    assert client.post("/optimize-energy", json=scenario(["x"], minimum_energy_kwh=600.0)).status_code == 422
+    assert client.post("/optimize-energy", json=scenario(["x"], initial_energy_kwh=900.0)).status_code == 400
+    assert client.post("/optimize-energy", json=scenario(["x"], minimum_energy_kwh=600.0)).status_code == 400
 
     # --- end-to-end, each replayed against the judge -------------------------------
     base = run(scenario(["Nothing unusual is planned for tomorrow."]))
@@ -348,8 +349,8 @@ def main():
     frozen = scenario(["Nothing to report."], max_charge_kwh_per_hour=0.0, max_discharge_kwh_per_hour=0.0)
     assert all(p["battery_action"] == "idle" for p in run(frozen)["hourly_plan"])
 
-    run(scenario(["   ", "Do not charge the battery between 2 PM and 4 PM."]))  # blank note → no_op
-    run(scenario(["x" * 50000]))                                                 # huge note, no blow-up
+    assert client.post("/optimize-energy", json=scenario(["   "])).status_code == 400  # blank note
+    run(scenario(["x" * 50000]))                                                    # huge note, no blow-up
 
     # infeasible as interpreted: the ladder degrades instead of breaking
     hard = run(scenario(["Grid import must not exceed 1 kWh from 6 PM to 9 PM.",
@@ -360,12 +361,14 @@ def main():
     test_scheduler()
 
     # --- organiser sample cases, if present --------------------------------------
-    if os.path.isfile("samples.json"):
-        raw = json.load(open("samples.json"))
-        cases = raw if isinstance(raw, list) else raw.get("cases", raw.get("scenarios", []))
+    sample_file = next((f for f in ("samples.json", "sample.json") if os.path.isfile(f)), None)
+    if sample_file:
+        raw = json.load(open(sample_file))
+        cases = (raw if isinstance(raw, list) else [raw] if "hours" in raw
+                 else raw.get("cases", raw.get("scenarios", [])))
         for c in cases:
             run(c if "hours" in c else c["request"])
-        print(f"samples.json: {len(cases)} organiser cases pass")
+        print(f"{sample_file}: {len(cases)} sample cases pass")
 
     print("all offline checks pass")
 
