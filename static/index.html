@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Campus Energy Optimization</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --line:#ddd; --card:#f7f7f7; --accent:#0a6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#111; --fg:#eee; --muted:#999; --line:#333; --card:#1b1b1b; --accent:#3d9; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 1000px; margin: 0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 20px; }
+  label { display:block; font-weight:600; margin:14px 0 4px; }
+  textarea { width:100%; font:12px/1.4 ui-monospace, monospace; background:var(--card); color:var(--fg);
+             border:1px solid var(--line); border-radius:6px; padding:8px; }
+  button { font:inherit; padding:8px 14px; margin-right:8px; border:1px solid var(--line);
+           border-radius:6px; background:var(--card); color:var(--fg); cursor:pointer; }
+  button.go { background:var(--accent); border-color:var(--accent); color:#000; font-weight:600; }
+  .row { display:flex; flex-wrap:wrap; gap:12px; margin:16px 0; }
+  .stat { flex:1 1 150px; background:var(--card); border:1px solid var(--line); border-radius:6px; padding:10px; }
+  .stat b { display:block; font-size:20px; }
+  .stat span { color:var(--muted); font-size:12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-left:3px solid var(--accent);
+          border-radius:6px; padding:10px; margin-bottom:8px; }
+  .card.noop { border-left-color:var(--muted); }
+  .card code { font-size:12px; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th, td { text-align:right; padding:4px 6px; border-bottom:1px solid var(--line); }
+  th:first-child, td:first-child, th:nth-child(4), td:nth-child(4) { text-align:left; }
+  #err { color:#c00; white-space:pre-wrap; }
+  .muted { color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Smart Campus Energy Optimization</h1>
+  <p class="sub">Operator notes in, interpreted directives and a 24-hour schedule out.</p>
+
+  <label for="notes">Operator notes (one per line, 1&ndash;3)</label>
+  <textarea id="notes" rows="4"></textarea>
+
+  <label for="scenario">Scenario JSON (hours + battery)</label>
+  <textarea id="scenario" rows="10"></textarea>
+
+  <div class="row">
+    <button id="example">Load example</button>
+    <button id="go" class="go">Optimize</button>
+    <span id="status" class="muted"></span>
+  </div>
+
+  <div id="err"></div>
+  <div id="out"></div>
+</main>
+
+<script>
+const DEMAND = [180,170,165,160,160,170,200,240,280,300,310,320,330,325,320,310,300,320,360,380,340,290,240,200];
+const SOLAR  = [0,0,0,0,0,5,30,80,140,200,250,280,290,280,250,200,140,70,20,0,0,0,0,0];
+const TARIFF = [7,7,6,6,6,7,8,10,12,12,11,11,10,10,11,12,14,16,18,18,15,12,9,9];
+
+function example() {
+  document.getElementById('notes').value = [
+    'Solar output will drop to about 20% from 1 PM to 3 PM.',
+    'Do not charge the battery between 2 PM and 4 PM.',
+    'The cafeteria menu changes tomorrow.'
+  ].join('\n');
+  document.getElementById('scenario').value = JSON.stringify({
+    scenario_id: 'GRID-101',
+    hours: DEMAND.map((d, h) => ({hour: h, demand_kwh: d, solar_kwh: SOLAR[h], tariff_bdt_per_kwh: TARIFF[h]})),
+    battery: {capacity_kwh: 500, initial_energy_kwh: 200, minimum_energy_kwh: 50,
+              max_charge_kwh_per_hour: 100, max_discharge_kwh_per_hour: 100}
+  }, null, 1);
+}
+
+const esc = s => String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+const num = v => Number(v).toFixed(2);
+
+function render(r) {
+  const cards = r.directive_interpretation.map(d => `
+    <div class="card ${d.applies ? '' : 'noop'}">
+      <b>Note ${d.note_index}: ${esc(d.directive_type)}</b> ${d.applies ? '' : '<span class="muted">(ignored)</span>'}
+      <div>${esc(d.explanation || '')}</div>
+      ${d.structured_adjustment ? `<code>${esc(JSON.stringify(d.structured_adjustment))}</code>` : ''}
+    </div>`).join('');
+
+  const rows = r.hourly_plan.map(p => `
+    <tr>
+      <td>${p.hour}</td>
+      <td>${num(p.grid_kwh)}</td>
+      <td>${num(p.solar_used_kwh)}</td>
+      <td>${esc(p.battery_action)}</td>
+      <td>${num(p.battery_kwh)}</td>
+      <td>${num(p.battery_energy_after_kwh)}</td>
+    </tr>`).join('');
+
+  document.getElementById('out').innerHTML = `
+    <div class="row">
+      <div class="stat"><b>${num(r.total_cost_bdt)}</b><span>total cost (BDT)</span></div>
+      <div class="stat"><b>${num(r.total_grid_kwh)}</b><span>total grid (kWh)</span></div>
+      <div class="stat"><b>${num(r.peak_grid_kwh)}</b><span>peak grid (kWh)</span></div>
+    </div>
+    <p class="muted">${esc(r.plan_summary || '')}</p>
+    ${cards}
+    <table>
+      <thead><tr><th>Hour</th><th>Grid kWh</th><th>Solar used</th><th>Battery</th><th>kWh</th><th>SoC after</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function optimize() {
+  const err = document.getElementById('err');
+  const status = document.getElementById('status');
+  err.textContent = '';
+  document.getElementById('out').innerHTML = '';
+  let body;
+  try {
+    body = JSON.parse(document.getElementById('scenario').value);
+  } catch (e) {
+    err.textContent = 'Scenario JSON is not valid: ' + e.message;
+    return;
+  }
+  body.operator_notes = document.getElementById('notes').value.split('\n').map(s => s.trim()).filter(Boolean);
+  status.textContent = 'optimizing...';
+  const t0 = performance.now();
+  try {
+    const res = await fetch('/optimize-energy', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(res.status + ' ' + JSON.stringify(data));
+    render(data);
+    status.textContent = Math.round(performance.now() - t0) + ' ms';
+  } catch (e) {
+    err.textContent = String(e);
+    status.textContent = '';
+  }
+}
+
+document.getElementById('example').onclick = example;
+document.getElementById('go').onclick = optimize;
+example();
+</script>
+</body>
+</html>

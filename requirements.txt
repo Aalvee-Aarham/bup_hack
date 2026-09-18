@@ -1,0 +1,8 @@
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx[http2]>=0.27
+numpy>=1.26
+scipy>=1.11
+pydantic>=2.7
+orjson>=3.10
+python-dotenv>=1.0
