@@ -24,7 +24,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 import guard
 import llm
@@ -45,6 +46,9 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Smart Campus Energy Optimization", lifespan=lifespan)
+# a public API: let a browser-based harness call it too
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
+                   allow_headers=["*"])
 
 STATIC = os.path.join(HERE, "static")
 if os.path.isdir(STATIC):
@@ -124,7 +128,7 @@ async def _unhandled(_request: Request, exc: Exception):
 
 # --- routes ------------------------------------------------------------------
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health():
     return _json({"status": "ok"})
 
@@ -160,7 +164,9 @@ def interpret_notes(raw, notes, capacity):
     out = []
     for i, note in enumerate(notes):
         v = guard.validate(by_index.get(i), capacity)
-        if v is None:
+        if v is not None:
+            v = guard.align_window(v, llm.explicit_window(note))
+        else:
             v = guard.validate(llm.rule_parse(i, note, capacity), capacity)
         if v is not None and not guard.grounded(note, v):
             log.warning("vetoed %s on a note with no energy content", v["directive_type"])
@@ -184,14 +190,31 @@ def _summary(directives, plan, tot, note, source):
     )
 
 
+def _bad_request(errors):
+    return _json({"detail": "invalid request", "errors": [
+        {"loc": [str(x) for x in e.get("loc", ())], "msg": str(e.get("msg", ""))} for e in errors][:20]}, 400)
+
+
 @app.post("/optimize-energy")
-async def optimize_energy(req: ScenarioIn):
+async def optimize_energy(request: Request):
+    # Parse the body ourselves: a harness posting valid JSON without a JSON content-type
+    # (curl -d @case.json, requests.post(data=...)) must not get a 400.
+    body = await request.body()
+    if body.startswith(b"\xef\xbb\xbf"):
+        body = body[3:]  # UTF-8 BOM from Windows editors
+    try:
+        req = ScenarioIn.model_validate_json(body)
+    except ValidationError as e:
+        return _bad_request(e.errors())
     scenario = req.model_dump()
     notes = scenario["operator_notes"]
     capacity = scenario["battery"]["capacity_kwh"]
 
-    raw, source = await llm.interpret(notes, capacity)
-    directives = interpret_notes(raw, notes, capacity)
+    # sentences addressed to the model are cut first; a pure injection becomes an empty note,
+    # which is a no_op without spending an LLM call
+    clean = [guard.strip_injection(n) for n in notes]
+    raw, source = await llm.interpret(clean, capacity)
+    directives = interpret_notes(raw, clean, capacity)
 
     try:
         # ~3ms of CPU, run inline on purpose: measured under 100 concurrent requests,

@@ -120,6 +120,38 @@ GROUPS = {
     ]),
 }
 
+# Harder, one note per group: unit conversions, shares of capacity, open-ended windows,
+# durations, single hours, and distractors that sound operational.
+HARD = {
+    "MWh cap": (D("max_grid_window", [18, 19, 20], 250), ["Limit grid imports to 0.25 MWh per hour between 6 and 9 PM."]),
+    "MWh reserve": (D("minimum_battery_reserve", [17, 18, 19], 150), ["Keep a reserve of 0.15 MWh in the battery from 17:00 to 20:00."]),
+    "percent charged": (D("minimum_battery_reserve", [19, 20, 21], 150), ["Keep the battery at least 30% charged from 7 PM to 10 PM."]),
+    "half capacity": (D("minimum_battery_reserve", [16, 17], 250), ["Hold half the battery's capacity in reserve from 4 PM to 6 PM."]),
+    "halved": (D("solar_reduction", [10, 11, 12], 0.5), ["PV output will be halved from 10 AM to 1 PM."]),
+    "three-quarters": (D("solar_reduction", [11, 12, 13], 0.75), ["Solar will run at three-quarters of normal between 11:00 and 14:00."]),
+    "a quarter": (D("solar_reduction", [12, 13], 0.25), ["Expect only a quarter of normal solar from noon until 2 PM."]),
+    "completely unavailable": (D("solar_reduction", [9, 10], 0.0), ["Solar panels will be completely unavailable from 9 AM to 11 AM."]),
+    "falls by 35%": (D("solar_reduction", [10, 11], 0.65), ["Solar output falls by 35% from 10:00 to 12:00."]),
+    "no grid at all": (D("max_grid_window", [19], 0), ["No grid import at all from 7 PM to 8 PM."]),
+    "duration": (D("no_discharge_window", [18, 19, 20]), ["Do not discharge the battery for three hours starting at 6 PM."]),
+    "after 9 PM": (D("no_charge_window", [21, 22, 23]), ["Charging is not allowed after 9 PM."]),
+    "before 6 AM": (D("no_charge_window", [0, 1, 2, 3, 4, 5]), ["Do not charge the battery before 6 AM."]),
+    "whole day": (D("max_grid_window", list(range(24)), 300), ["Grid import is capped at 300 kWh for the whole day."]),
+    "midnight to 4 AM": (D("minimum_battery_reserve", [0, 1, 2, 3], 100), ["Keep 100 kWh in reserve from midnight to 4 AM."]),
+    "noon to 3 PM": (D("solar_reduction", [12, 13, 14], 0.5), ["Solar drops to 50% from noon to 3 PM."]),
+    "11 PM to midnight": (D("no_discharge_window", [23]), ["Do not discharge the battery between 11 PM and midnight."]),
+    "the 14:00 hour": (D("no_charge_window", [14]), ["Battery charging is blocked during the 14:00 hour."]),
+    "single hour": (D("no_charge_window", [15]), ["Do not charge the battery at 3 PM."]),
+    "20:00 to 23:00": (D("max_grid_window", [20, 21, 22], 280), ["From 20:00 to 23:00 keep grid import under 280 kWh."]),
+    "afternoon shorthand": (D("solar_reduction", [13, 14, 15], 0.4), ["Solar is reduced to 40% from 1 in the afternoon to 4."]),
+    "evening peak": (D("no_discharge_window", [18, 19, 20, 21]), ["Discharging is prohibited during the evening peak from 6 to 10 PM."]),
+    "uploaded data": (D("no_op"), ["Grid tariff data for tomorrow has been uploaded; no operational changes."]),
+    "vendor visit": (D("no_op"), ["The battery vendor visits at 2 PM for a routine inspection, with no impact on operation."]),
+    "past accuracy": (D("no_op"), ["Solar forecast accuracy was 92% last week."]),
+    "already in forecast": (D("no_op"), ["The demand forecast already includes the exam hall load from 9 to 12."]),
+    "normal solar": (D("no_op"), ["Weather looks clear; solar should perform normally all day."]),
+}
+
 DEMAND = [180, 170, 165, 160, 160, 170, 200, 240, 280, 300, 310, 320,
           330, 325, 320, 310, 300, 240, 230, 240, 235, 220, 200, 190]
 SOLAR = [0, 0, 0, 0, 0, 5, 30, 80, 140, 200, 250, 280,
@@ -141,8 +173,9 @@ def pct(xs, p):
     return xs[min(len(xs) - 1, int(round(p * (len(xs) - 1))))]
 
 
-async def interpretation_suite(client, tag):
-    items = [(group, text, truth) for group, (truth, texts) in GROUPS.items() for text in texts]
+async def interpretation_suite(client, tag, groups=None):
+    groups = groups or GROUPS
+    items = [(group, text, truth) for group, (truth, texts) in groups.items() for text in texts]
     random.Random(7).shuffle(items)
     batches, i, rng = [], 0, random.Random(11)
     while i < len(items):
@@ -150,7 +183,7 @@ async def interpretation_suite(client, tag):
         batches.append(items[i:i + k])
         i += k
 
-    results = {g: [] for g in GROUPS}
+    results = {g: [] for g in groups}
     invalid, lat, sources, ratios, infeasible = [], [], {}, [], []
 
     async def one(n, batch):
@@ -264,7 +297,9 @@ async def main():
         t0 = time.perf_counter()
         r = await client.get(f"{BASE}/health")
         print(f"health {r.status_code} {r.text} in {time.perf_counter() - t0:.2f}s  ({BASE})")
-        if not LOAD_ONLY:
+        if "--hard" in sys.argv:
+            await interpretation_suite(client, tag, HARD)
+        elif not LOAD_ONLY:
             await interpretation_suite(client, tag)
         if not INTERP_ONLY:
             await load(client, tag)

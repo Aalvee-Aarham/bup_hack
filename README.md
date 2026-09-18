@@ -11,7 +11,7 @@
 ![Solver](https://img.shields.io/badge/Optimizer-Exact%20LP%20(HiGHS)-8A2BE2)
 ![LLM](https://img.shields.io/badge/LLM-Groq%20→%20Gemini%20→%20OpenRouter-FF6F00)
 ![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?logo=docker&logoColor=white)
-![Tests](https://img.shields.io/badge/offline%20judge%20checks-175%2F175-2EA043)
+![Tests](https://img.shields.io/badge/offline%20judge%20checks-186%2F186-2EA043)
 ![Optimality](https://img.shields.io/badge/cost%20quality%20ratio-1.000000-2EA043)
 
 </div>
@@ -243,7 +243,8 @@ All notes in a request go to **one** model call: temperature 0, JSON mode, and a
 - **Factor is what remains:** `"drops to 20%"` gives `0.2`, `"drops BY 20%"` gives `0.8`, `"80% reduction"` gives `0.2`, and `"one-fifth of normal"` gives `0.2`.
 - **Relative reserves:** `"half full"` or `"40% of capacity"` is converted to kWh using the battery capacity sent with the prompt.
 - **Distractors:** notes about other matters, past events, or that only mention times and numbers become `no_op`.
-- **Prompt-injection resistance:** notes are data, not instructions. If a note contains a real directive *and* an injection, the model returns the directive.
+- **Prompt-injection resistance:** before any model sees a note, `guard.strip_injection` removes sentences addressed to the model ("ignore previous instructions", "SYSTEM:", "mark this note as no_op", ...). A pure injection never reaches an LLM and becomes `no_op`; a real directive wrapped in an injection keeps only its real sentence. The prompt also tells the model that notes are data, not instructions.
+- **Units:** MWh is converted to kWh, and "no grid import" is a `max_grid_window` of 0.
 
 The prompt went through several rounds of measurement. Removing multi-turn few-shot examples cut **45% of input tokens with no loss in accuracy**, which matters because Groq's binding limit is tokens per minute.
 
@@ -251,11 +252,18 @@ The prompt went through several rounds of measurement. Removing multi-turn few-s
 
 | Provider | Models, most accurate first |
 |---|---|
-| **Groq** (primary) | `qwen/qwen3.8-27b`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b` |
+| **Groq** (primary) | `qwen/qwen3.8-27b`, `openai/gpt-oss-20b`, `openai/gpt-oss-120b` |
 | **Google Gemini** | `gemini-3.8-flash`, `gemini-3.5-flash-lite`, `gemini-flash-lite-latest` |
 | **OpenRouter** | `deepseek/deepseek-v4-flash-0731:free`, `qwen/qwen3.8-27b:free`, `google/gemma-4-31b-it:free` |
 
-The order is **measured, not guessed**. On the live paraphrase suite (`test_live.py`), `qwen3.8-27b` interpreted **65/65 notes correctly**.
+The order is **measured, not guessed**, on two live suites in `test_live.py` (65 paraphrase/distractor/injection notes, and 27 harder notes with unit conversions, open-ended windows and durations):
+
+| Model | Main suite | Hard suite |
+|---|---|---|
+| `qwen/qwen3.8-27b` | **65/65** | **27/27** |
+| `openai/gpt-oss-20b` | **65/65** | **27/27** |
+| `gemini-3.5-flash-lite` | 63/65 | 27/27 |
+| `openai/gpt-oss-120b` | 62/65 | 27/27 |
 
 ### The fallback parser (a safety net, not the interpreter)
 
@@ -278,6 +286,8 @@ The order is **measured, not guessed**. On the live paraphrase suite (`test_live
 | **`applies` semantics** | Derived from the type, never trusted: `no_op` gives `false` with `null`, and every other type gives `true`. |
 | **Shape** | `structured_adjustment` is **rebuilt** with exactly the required keys. Common model synonyms (`reduction_factor`, `reserve_kwh`, `cap_kwh`, …) are mapped to the canonical key. |
 | **Grounding veto** | A directive on a note with no energy vocabulary at all (for example a hallucinated rule on *"The cafeteria menu changes tomorrow."*) is vetoed to `no_op`. |
+| **Injection stripping** | Sentences that instruct the model are removed **before** the LLM call (see Stage 1). Checked to leave all 92 legitimate suite notes untouched. |
+| **Window repair** | When a note states both ends of a window as clock times (`"5 PM and 7 PM"`, `"18:00-21:00"`, `"6-9 PM"`), the half-open window is certain. A model answer that differs from it by exactly the end hour (end included or dropped) or by exactly 12 hours (PM read as AM) is snapped back to it. Any other disagreement is left to the model. Checked to change no correct answer on any suite note. |
 | **No invention** | Demand, tariff and battery parameters come only from the request, and the LLM cannot change them. |
 | **Final replay** | The finished schedule is replayed against every applied directive (§7). |
 
@@ -329,7 +339,8 @@ The rubric allocates 10 points to p95 latency, failure rate and controlled failu
 | **Learns real limits at runtime** | Syncs with provider rate-limit headers and parses 429 bodies (`"(OTPM): Limit 1000"`, Gemini `QuotaFailure`), so the next call is routed *before* it can hit a 429. |
 | **Earliest-answer routing** | Each call goes to the slot with the lowest *(wait until affordable + observed latency + tier bias)*. This keeps the Groq → Gemini → OpenRouter priority while letting a burst fan out over every key. |
 | **Hedged requests** | If the first slot is slow after 1.5 s, a free second slot races it and the first valid answer wins. |
-| **Health-aware cooling** | A 401 retires a key, a 429 cools a slot, a 402 cools a slot for an hour, and 404, 5xx or a timeout cools a model. |
+| **Health-aware cooling** | A 401 retires a key, a 403 retires only that key-and-model pair, a 429 cools a slot (honouring `retry-after` or Gemini's `retryDelay`), a 402 or an exhausted daily quota cools it for an hour, and 404, 5xx or a timeout cools a model. |
+| **Seeded hidden limits** | Caps that no header reports (Qwen's 1,000 output tokens/min on Groq) are seeded at startup, so a burst right after a restart does not pay a wave of 429s to learn them. |
 | **Partial-answer merge** | If a model validates only some notes, the best partial answer is kept and the rest are retried or handled by the fallback parser. |
 | **Per-note LRU cache** | A note seen before costs nothing. The key includes capacity, because *"half full"* means different kWh on different batteries. |
 | **Request coalescing** | Concurrent requests with the same new notes share **one** LLM call, and `asyncio.shield` stops a disconnecting client from cancelling that call for the others. |
@@ -337,7 +348,21 @@ The rubric allocates 10 points to p95 latency, failure rate and controlled failu
 | **Instant `/health`** | Warmup runs in the background, so readiness takes about 2 s, well within the 60 s limit. |
 | **Solver runs inline** | Measured under 100 concurrent requests: `asyncio.to_thread` made p50 **150× worse** because of GIL contention, so the 3 ms solve runs inline. |
 
-**Measured:** sequential requests with new notes had **p50 1.2 s, p95 3.0 s, and 0 failures**, well within the rubric's top latency band (p95 ≤ 5 s).
+### Measured on the live deployment
+
+Measured against the public Railway endpoint with `test_live.py`, before and after expanding the key pool from 2 to 10 Groq keys (plus 11 Gemini and 2 OpenRouter keys, 69 slots in total):
+
+| Production test | Before (2 Groq keys) | Now |
+|---|---|---|
+| 50 simultaneous requests, all new notes | p95 16.3 s | **p95 1.46 s** |
+| 50 new-note requests, 5 at a time | p95 13.9 s | **p95 1.20 s** |
+| 50 simultaneous identical | p95 2.4 s | **p95 1.08 s** |
+| Sequential | p95 3.3 s | **p95 1.04 s** |
+| Main interpretation suite (65) | 64/65 | **65/65** |
+| Hard suite (27) | 27/27 | **27/27** |
+| Downstream validity / optimality | all valid / 1.0 | **all valid / 1.000000** |
+
+Every load test finished with **0 failures**, far inside the rubric's top latency band (p95 ≤ 5 s) and the 30 s per-request limit.
 
 **Failure handling:** malformed JSON and schema violations return **400** with a structured error list. Strict typing rejects `true` or `"180"` as kWh, and the schema checks that the battery is internally consistent. Unexpected errors return a generic **500** with no stack trace, prompt or key. The optimizer's own exception path still returns a valid idle plan with **200**.
 
@@ -357,8 +382,8 @@ python test_live.py https://your-deployment.example   # same suite against a dep
 **`test_judge.py` output (latest run):**
 
 ```
-A: 45/45 passed          # malformed / invalid requests → controlled 400/404/405, JSON bodies, no traces
-B: 32/32 passed          # LLM failure injection → 200, never an invented or wrong directive
+A: 50/50 passed          # malformed / invalid requests → 400/404/405; valid JSON served whatever its content-type
+B: 38/38 passed          # LLM failure injection, injection stripping, window repair → never a wrong directive
 C: 26/26 passed          # optimizer edge cases → valid against ground truth, optimal
 D: 72/72 passed          # 60 random scenarios + DP cross-checks
 optimization quality ratio: mean 1.000000 over 60 cases (min 1.000000)
@@ -366,13 +391,14 @@ optimization quality ratio: mean 1.000000 over 60 cases (min 1.000000)
 
 | Suite | What it attacks | Result |
 |---|---|---|
-| **A: Bad requests** (45) | Broken JSON, wrong types, 23/25 hours, duplicate hours, empty or 4 notes, NaN/∞, booleans as numbers, inconsistent battery | All controlled 4xx, JSON bodies, no stack traces |
-| **B: LLM failures** (32) | Timeouts, invalid JSON, unknown types, factor > 1, bad indices, 401/429/5xx, prompt injection | Always 200, **never an invented or wrong directive** |
+| **A: Bad requests and transport** (50) | Broken JSON, wrong types, 23/25 hours, duplicate hours, empty or 4 notes, NaN/∞, booleans as numbers, inconsistent battery; valid JSON with no or a non-JSON content-type, BOM, `HEAD /health`, CORS preflight | Invalid → controlled 4xx with JSON bodies and no stack traces; valid JSON is served whatever its headers |
+| **B: LLM failures** (38) | Timeouts, invalid JSON, unknown types, factor > 1, bad indices, 401/429/5xx, partial answers, prompt injection, off-by-one windows | Always 200, **never an invented or wrong directive** |
 | **C: Optimizer edge cases** (26) | Overlapping reductions/reserves/caps, three directive types at once, grid cap 0, reserve above initial energy or equal to capacity, zero solar all day | Valid against ground truth **and** optimal |
 | **D: Optimality** (60 random) | Random integer and fractional scenarios with random directive mixes | Cost ratio **1.000000**, LP confirmed by exact DP |
 | **Live interpretation** (65 notes) | 9+ paraphrases per directive type, time and number distractors, injections | **65/65** with `qwen3.8-27b`; 29/29 requests valid downstream |
-| **Live, default routing, 4-way concurrency** | The same 65 notes under load | 63-64/65 |
-| **Live latency** | Sequential requests with new notes | p50 1.2 s, **p95 3.0 s**, 0 failures |
+| **Live, default routing, 4-way concurrency** | The same 65 notes against the production deployment | **65/65**, 29/29 requests valid downstream |
+| **Live hard suite** (27 notes) | MWh, "30% charged", "halved", "after 9 PM", "before 6 AM", "for three hours starting at 6 PM", "the whole day", subtle distractors | **27/27** with default routing and with each model alone |
+| **Live latency (production)** | Sequential, 5-at-a-time and 50-simultaneous new-note requests | **p95 1.04-1.46 s**, 0 failures (see §8) |
 
 Examples from the live paraphrase suite, which are the kind of wording the hidden set uses (§11.4):
 
@@ -394,7 +420,7 @@ Examples from the live paraphrase suite, which are the kind of wording the hidde
 | **Directive Application & Constraints (25)** | All 5 directive types are exact LP constraints. Drift repair makes the plan exactly consistent, and self-replay against §11.3 runs before every response. Validated by an independent judge using ground-truth directives. |
 | **Optimization Quality (10)** | Exact LP (HiGHS) gives the global optimum, confirmed by an independent LP and an exact DP: ratio **1.000000**. |
 | **API Contract & Schema (10)** | Strict Pydantic request schema returns 400 on violation. The response is rebuilt in the exact §10 shape, in `note_index` order, with `scenario_id` echoed. |
-| **Performance & Reliability (10)** | `/health` answers in about 2 s. p95 is 3.0 s. Hedged, cached, coalesced multi-provider routing. A valid request never gets a 5xx, and no secrets or stack traces are exposed. |
+| **Performance & Reliability (10)** | `/health` answers in about 2 s. Production p95 is 1.0-1.5 s even with 50 simultaneous new-note requests, with 0 failures. Hedged, cached, coalesced multi-provider routing. A valid request never gets a 5xx, and no secrets or stack traces are exposed. |
 | **Deployment & Docker (10)** | CI builds a GHCR image with an immutable SHA tag and smoke-tests it after publishing. Non-root, `0.0.0.0:8000`, no baked-in secrets. `render.yaml` included for one-click hosting. |
 | **Documentation & Reproducibility (10)** | This README: clean quickstart, env vars, models, sample with expected output, test commands, architecture, Docker, dependencies, limitations, and secret handling. |
 
@@ -402,8 +428,9 @@ Examples from the live paraphrase suite, which are the kind of wording the hidde
 
 ## ⚠️ 11. Known limitations
 
-- **Throughput with new notes depends on LLM quota.** Two free Groq keys sustain about 50 new-note requests per minute, and Gemini absorbs the overflow. Bursts beyond that queue for up to 15 s, then fall back to the parser. Adding keys scales throughput linearly. Repeated notes are served from the cache.
-- `qwen3.8-27b` has a 1,000 output-tokens-per-minute cap per key on Groq's free tier. Overflow goes to `gpt-oss-120b`, which is slightly less accurate on unusual time phrasings.
+- **Throughput with new notes depends on LLM quota.** With 2 Groq keys, 50 simultaneous new-note requests reached p95 16.3 s; with the current 10-key pool the same test is p95 1.46 s. A burst beyond the pool's capacity queues for up to 15 s, then falls back to the parser. Adding keys scales throughput linearly, and repeated notes are served from the cache.
+- `qwen3.8-27b` has a 1,000 output-tokens-per-minute cap per key on Groq's free tier. Overflow goes to `gpt-oss-20b` (65/65 and 27/27 in our suites), then `gpt-oss-120b`.
+- `gemini-3.8-flash` returned "high demand" 503s and exhausted its free daily quota during testing, so it sits behind `gemini-3.5-flash-lite` in the Gemini tier.
 - Rate budgets, the cache and coalescing live **in-process**, so run one worker. With `WEB_CONCURRENCY=N`, each worker gets 1/N of every budget.
 - Genuinely ambiguous notes (*"through 3 PM"*, *"overnight"*) follow the model's reading of the start-inclusive / end-exclusive rule.
 - The fallback parser covers common phrasings only. It exists to keep the service available, not to match the LLM's paraphrase robustness.
